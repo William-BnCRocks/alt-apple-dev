@@ -1465,3 +1465,46 @@ rcodesign seals the plists, and a device install runs it with
 `xtool install`; `asc.py validate` now FAILs an ipa whose Info.plists carry
 any surviving `$(...)`. Receipt
 `receipts/2026-10-07-app-identifier-prefix.md`.
+
+## Expo's launch storyboard compiles on Linux, 2026-10-07
+
+**63. `ibtool` compiles expo-splash-screen's `SplashScreen.storyboard` (the launch
+screen every Expo prebuild writes) byte-identical to Xcode 26.5.** It refused the
+file at its first check, `device retina6_12 unsupported` (iPhone 15/16, 393x852,
+was missing from the device table); a caller that ran it as `--compile OUT IN`
+saw the xib path's "no <objects> element" instead, since a storyboard compiles as
+`ibtool IN.storyboard --compilation-directory DIR`. Past the device the generated
+markup differed from what Interface Builder writes, and Xcode 26.5's ibtool on
+devmac served as the oracle (its output equals the `.storyboardc` in Teatime's
+Xcode-built archive):
+
+- Boolean attributes are read with `NSString.boolValue`: Expo writes
+  `clipsSubviews="true"`, `userInteractionEnabled="false"`,
+  `translatesAutoresizingMaskIntoConstraints="false"`; `1`, `0`, `t`, `Yes` and
+  `nope` probe the same way. A flag is archived only when it differs from
+  UIView's default.
+- A root view's `userInteractionEnabled="NO"` archives `UIUserInteractionDisabled`
+  (after `UIHidden`, before `UIMultipleTouchEnabled`).
+- `<imageView image="...">` (the attribute form, no `<imageReference>`) is the
+  image; an asset-catalog image archives as a 1x1 `UIImageNibPlaceholder`.
+- An image view archives `UIOpaque` like any view, except one with a
+  `preferredSymbolConfiguration` (NetNewsWire's FeedCell header).
+- `translatesAutoresizingMaskIntoConstraints=NO` is archived only for a view some
+  constraint involves.
+- storyboardc `Info.plist` offsets are sized by the offset table's position, as
+  CFBinaryPlist does (an offset table at byte 250 keeps 1-byte offsets).
+
+Xcode 26 and 27 differ in one marker: 27.0 ends every iOS nib with
+`IBUINibLNEVersionKey = 1` and an `LNE\0` trailer, while 26.5 writes them only
+when every archived class is a plain view, layout guide, constraint, colour,
+proxy or class swapper (110 storyboard nibs, no exception; NetNewsWire's labels,
+image views, navigation items, tables and collections all drop it). The default
+output stays Xcode 27.0's; `OAD_IBTOOL_XCODE_MAJOR=26` reproduces 26's marker,
+which makes the Expo splash byte-identical to the 26.5 reference. That switch
+models only the marker: 26.5's NetNewsWire Main and Inspector nibs differ from
+27.0's in other ways too. The marker is not needed to load a nib: Xcode 27 emits
+it for apps whose deployment target is far below iOS 27, and the trailer sits
+after the class table that the NIBArchive header indexes. `ibtool --self-test`
+now also compiles three Expo splash variants
+(`tests/ibtool/src/Expo/`) against `tests/ibtool/golden-xcode26/`, byte for byte
+in 26 mode and modulo the marker in the default mode.

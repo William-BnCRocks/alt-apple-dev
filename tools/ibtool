@@ -60,6 +60,18 @@ FONT_STYLES = {  # UICTFontTextStyle -> (font name, UIFontTraits, NSSize) at dep
 }
 
 LOCALIZE = False  # storyboard compiles wrap user strings in NSLocalizableString
+# OAD_IBTOOL_XCODE_MAJOR=26 reproduces Xcode 26's LNE marker (see _xcode26_lne);
+# anything else (the default) is Xcode 27.0, which marks every iOS nib.
+XCODE_MAJOR = os.environ.get("OAD_IBTOOL_XCODE_MAJOR", "27")
+# Archived classes Xcode 26 still marks with IBUINibLNEVersionKey + the LNE
+# trailer: a nib holding any other class (UILabel, UIImageView, UINavigationItem,
+# UITableView, ...) gets neither. Xcode 26.5 oracle over 110 storyboard nibs
+# (NetNewsWire Main/Inspector/LaunchScreen and expo-splash-screen variants):
+# 48 marked, 62 unmarked, no exception.
+XCODE26_LNE_CLASSES = frozenset({
+    "NSObject", "NSArray", "NSMutableArray", "NSDictionary", "NSString",
+    "UIProxyObject", "UIClassSwapper", "UIRuntimeOutletConnection", "UIView",
+    "UILayoutGuide", "NSLayoutConstraint", "UIColor"})
 BLUR_MATERIALS = {  # blurEffect style -> (MaterialStyle, AutomaticStyle, Style)
     "systemUltraThinMaterial": (6, 4, 1),  # ImageViewController golden
 }
@@ -1209,6 +1221,10 @@ def finalize(b, root):
     creation_idx = {}
     SUPERCLASS = {"UIColor": "NSColor", "UIFont": "NSFont",
                   "UITableViewCellContentView": "UIView"}
+    trailer = b"LNE\x00"
+    if not _xcode26_lne(b):
+        root.values = [kv for kv in root.values if kv[0] != "IBUINibLNEVersionKey"]
+        trailer = b""
     for o in b.objects:
         o.value_start = len(values)
         for key, v in o.values:
@@ -1258,7 +1274,15 @@ def finalize(b, root):
     for v in values:
         v.key_idx = remap[creation_keys[v.key_idx]]
     arch.keys = [k.encode("ascii") for k in key_bytes]
-    return N.encode(arch)
+    return N.encode(arch, trailer)
+
+
+def _xcode26_lne(b):
+    """False when emulating Xcode 26 and the graph holds a class it does not
+    LNE-mark; the nib then carries no IBUINibLNEVersionKey and no trailer."""
+    if XCODE_MAJOR != "26":
+        return True
+    return all(o.cls in XCODE26_LNE_CLASSES for o in b.objects)
 
 
 SELF_TEST_NIBS = ("TinyView", "TinyLabel", "SettingsTableViewCell", "SettingsComboTableViewCell")
@@ -1305,7 +1329,9 @@ def _bplist_bytes(plist, alias_entry_key=False):
 
     assign(plist)
     body = b"".join(objects)
-    off_sz = 1 if 8 + len(body) + len(objects) <= 255 else 2
+    # CFBinaryPlist sizes the offsets by the offset table's own position
+    # (Xcode 26.5 oracle: an offset table at byte 250 keeps 1-byte offsets)
+    off_sz = 1 if 8 + len(body) < 256 else 2
     pos = 8  # offsets are absolute file positions (magic included)
     table = b""
     for x in objects:
@@ -1973,9 +1999,22 @@ class _Scene:
         return arr
 
 
+def _ib_bool(value):
+    """An IB boolean attribute as Xcode reads it: NSString.boolValue. Leading
+    whitespace, one sign and leading zeros are skipped; Y/y/T/t or a digit 1-9
+    is YES, anything else NO. Generated documents (expo-splash-screen's
+    SplashScreen.storyboard) write "true"/"false", which read as YES/NO
+    (Xcode 26.5 oracle, also "1", "0", "t", "Yes", "nope")."""
+    s = value.lstrip()
+    if s.startswith(("+", "-")):
+        s = s[1:]
+    s = s.lstrip("0")
+    return s[:1] != "" and s[0] in "YyTt123456789"
+
+
 def _bool_key(el, name):
     """Apple stores UI* flags inverted: attr YES -> stored false; else absent."""
-    if el.get(name) == "YES":
+    if el.get(name) is not None and _ib_bool(el.get(name)):
         return False
     return None
 
@@ -2082,11 +2121,15 @@ def _view_common(b, el, o, where, resources, named, subs_slot):
     """Shared view keys after UISubviews: DeepDrawRect, inverted flags, mask,
     content mode, clips, tint, DoesNotTranslate."""
     o.add("UIDeepDrawRect", *b.boolean(False))
-    if el.get("opaque") != "NO":
+    if el.get("opaque") is None or _ib_bool(el.get("opaque")):
         o.add("UIOpaque", *b.boolean(False))
     hidden = _bool_key(el, "hidden")
     if hidden is not None:
         o.add("UIHidden", *b.boolean(hidden))
+    if el.get("userInteractionEnabled") is not None \
+            and not _ib_bool(el.get("userInteractionEnabled")):
+        # between UIHidden and UIMultipleTouchEnabled (Xcode 26.5 oracle)
+        o.add("UIUserInteractionDisabled", *b.boolean(False))
     mt = _bool_key(el, "multipleTouchEnabled")
     if mt is not None:
         o.add("UIMultipleTouchEnabled", *b.boolean(mt))
@@ -2097,15 +2140,31 @@ def _view_common(b, el, o, where, resources, named, subs_slot):
         if cm not in CONTENT_MODES:
             raise XibError(f"<{el.tag}> contentMode={cm!r} not supported ({where})")
         o.add("UIContentMode", *b.int8(CONTENT_MODES[cm]))
-    if el.get("clipsSubviews") is not None:
-        o.add("UIClipsToBounds", *b.boolean(el.get("clipsSubviews") != "YES"))
+    if el.get("clipsSubviews") is not None and _ib_bool(el.get("clipsSubviews")):
+        o.add("UIClipsToBounds", *b.boolean(False))
     tint = el.find("color[@key='tintColor']")
     if tint is not None:
         o.add("UITintColor", *b.ref(build_color_el(b, tint, where, resources, named)))
+    # translatesAutoresizingMaskIntoConstraints=NO counts only for a view some
+    # constraint involves (Xcode 26.5 oracle: an unconstrained view keeps it)
     tr = el.get("translatesAutoresizingMaskIntoConstraints")
-    if tr is not None:
+    if tr is not None and not _ib_bool(tr) \
+            and (CONSTRAINED_IDS is None or el.get("id") in CONSTRAINED_IDS):
         o.add("UIViewDoesNotTranslateAutoresizingMaskIntoConstraints",
-              *b.boolean(tr != "NO"))
+              *b.boolean(False))
+
+
+def _constrained_ids(doc):
+    """Ids of every view a constraint involves: its items, or the view that
+    owns it when an item is implicit."""
+    ids = set()
+    for v in doc.iter():
+        block = v.find("constraints") if isinstance(v.tag, str) else None
+        for c in (block.findall("constraint") if block is not None else ()):
+            ids.add(c.get("firstItem") or v.get("id"))
+            if c.get("secondItem"):
+                ids.add(c.get("secondItem"))
+    return ids
 
 
 def _build_kids(sb, el, where, resources, named, id_map, state):
@@ -2251,8 +2310,10 @@ def _background_configuration(b, style, where):
 
 
 def _scene_image_view(sb, el, where, resources, named, id_map):
-    """Storyboard imageView: no UIOpaque (FeedCell header golden); tint before
-    DoesNotTranslate; image and preferredSymbolConfiguration last."""
+    """Storyboard imageView: the shared view flags (_view_common), except that
+    an image view with a preferredSymbolConfiguration archives no UIOpaque
+    (FeedCell header golden; Xcode 26.5 oracle: the same view without it is
+    opaque); image and preferredSymbolConfiguration last."""
     b = sb.b
     (bx, by, bw, bh), (cx, cy) = _bounds_center(el)
     o = b.new("UIImageView")
@@ -2260,25 +2321,9 @@ def _scene_image_view(sb, el, where, resources, named, id_map):
         id_map[el.get("id")] = o
     o.add("UIBounds", *b.geom(bx, by, bw, bh))
     o.add("UICenter", *b.geom(cx, cy))
-    o.add("UIDeepDrawRect", *b.boolean(False))
-    if el.get("userInteractionEnabled") is not None:
-        o.add("UIUserInteractionDisabled", *b.boolean(el.get("userInteractionEnabled") != "NO"))
-    o.add("UIAutoresizeSubviews", *b.boolean(False))
-    o.add("UIAutoresizingMask", *b.int8(_autoresizing_mask(el, where)))
-    cm = el.get("contentMode")
-    if cm is not None and cm != "scaleToFill":
-        if cm not in CONTENT_MODES:
-            raise XibError(f"<imageView> contentMode={cm!r} not supported ({where})")
-        o.add("UIContentMode", *b.int8(CONTENT_MODES[cm]))
-    if el.get("clipsSubviews") is not None:
-        o.add("UIClipsToBounds", *b.boolean(el.get("clipsSubviews") != "YES"))
-    tint = el.find("color[@key='tintColor']")
-    if tint is not None:
-        o.add("UITintColor", *b.ref(build_color_el(b, tint, where, resources, named)))
-    tr = el.get("translatesAutoresizingMaskIntoConstraints")
-    if tr is not None:
-        o.add("UIViewDoesNotTranslateAutoresizingMaskIntoConstraints",
-              *b.boolean(tr != "NO"))
+    _view_common(b, el, o, where, resources, named, None)
+    if el.find("preferredSymbolConfiguration") is not None:
+        o.values = [kv for kv in o.values if kv[0] != "UIOpaque"]
     group = []
     if el.find("constraints") is not None:
         arr, cons = build_constraints_block(b, el, o, id_map, where)
@@ -2290,6 +2335,8 @@ def _scene_image_view(sb, el, where, resources, named, id_map):
     o.add("UIViewSemanticContentAttribute", *b.int8(0))
     o.add("UIViewLargeContentStoredProperties", N.NIL, None)
     img = el.find("imageReference[@key='image']")
+    if img is None and el.get("image") is not None:
+        img = el  # the older image="..." [catalog="system"] attribute form
     if img is not None:
         o.add("UIImage", *b.ref(_image_ref(b, img, where)))
     psym = _symbol_config(b, el, "preferredSymbolConfiguration", where)
@@ -3736,7 +3783,7 @@ def _scroll_common(b, o, el, where, delegate_first=False):
 
 
 DEVICE_SIZES = {"retina4": (320, 568), "retina4_0": (320, 480), "retina4_7": (375, 667),
-                "retina5_5": (414, 736), "retina5_9": (320, 568), "retina6_1": (414, 896), "retina6_3": (393, 852),
+                "retina5_5": (414, 736), "retina5_9": (320, 568), "retina6_1": (414, 896), "retina6_3": (393, 852), "retina6_12": (393, 852),
                 "retina6_5": (414, 896)}
 
 
@@ -3784,6 +3831,7 @@ class _ViewData:
 
 
 NAV_BAR_CENTER_Y = None  # set by compile_storyboard when the scene sits in a nav
+CONSTRAINED_IDS = None  # set by compile_storyboard: views some constraint involves
 
 
 def build_table_view(b, tv_el, where, resources, vc_id, named=None, id_map=None, device=None):
@@ -4313,8 +4361,9 @@ def _compile_storyboard_inner(path, compilation_dir, doc, name):
     for tag in ("viewController", "tableViewController", "collectionViewController"):
         for vc in doc.iterfind(f"scenes/scene/objects/{tag}"):
             vcs[vc.get("id")] = vc
-    global NAV_BAR_CENTER_Y
+    global NAV_BAR_CENTER_Y, CONSTRAINED_IDS
     NAV_BAR_CENTER_Y = None
+    CONSTRAINED_IDS = _constrained_ids(doc)
     for scene in scenes:
         nav = scene.find("objects/navigationController")
         if nav is not None:
@@ -4447,6 +4496,68 @@ SB_SELF_TEST = (
 )
 
 
+GOLDEN26 = os.path.join(_TOOLS, "..", "tests", "ibtool", "golden-xcode26")
+# (label, src rel under SRC, .storyboardc rel under GOLDEN26): Xcode 26.5 output
+SB_XCODE26_SELF_TEST = (
+    ("Expo SplashScreen.storyboardc", "Expo/SplashScreen.storyboard",
+     "SplashScreen.storyboardc"),
+    # unconstrained image view: translatesAutoresizingMaskIntoConstraints=false is moot
+    ("Expo SplashScreenNoConstraints.storyboardc",
+     "Expo/SplashScreenNoConstraints.storyboard", "SplashScreenNoConstraints.storyboardc"),
+    # generated entry name: an Info.plist offset table at byte 250 keeps 1-byte offsets
+    ("Expo SplashScreenNoIdentifier.storyboardc",
+     "Expo/SplashScreenNoIdentifier.storyboard", "SplashScreenNoIdentifier.storyboardc"),
+)
+
+
+def _graph_without_lne(raw):
+    """A nib's object graph (class, keys, types, payloads) minus the LNE key."""
+    a = N.parse(raw)
+    return [(a.object_class(i), [(a.key(v.key_idx), v.type, v.payload)
+                                 for v in a.object_values(o)
+                                 if a.key(v.key_idx) != "IBUINibLNEVersionKey"])
+            for i, o in enumerate(a.objects)]
+
+
+def _xcode26_self_test(failed, compiled):
+    """Xcode 26 emulation is byte-identical to the Xcode 26.5 goldens; the
+    default (Xcode 27.0) output differs from them only by the LNE marker."""
+    import shutil
+    import tempfile
+    global XCODE_MAJOR, TARGET_MODULE
+    saved = XCODE_MAJOR
+    TARGET_MODULE = None
+    try:
+        for label, src_rel, golden_rel in SB_XCODE26_SELF_TEST:
+            want = _tree_bytes(os.path.join(GOLDEN26, golden_rel))
+            for name, raw in want.items():
+                trailer = b"LNE\x00" if raw.endswith(b"LNE\x00") else b""
+                if name.endswith(".nib") and N.encode(N.parse(raw), trailer) != raw:
+                    failed.append(f"round-trip xcode26 {name}")
+            for major in ("26", "27"):
+                XCODE_MAJOR = major
+                tmp = tempfile.mkdtemp(prefix="/tmp/ibtool-sbtest-")
+                try:
+                    mine = _tree_bytes(compile_storyboard(os.path.join(SRC, src_rel), tmp))
+                finally:
+                    shutil.rmtree(tmp, ignore_errors=True)
+                if major == "26":
+                    bad = sorted(k for k in set(mine) | set(want) if mine.get(k) != want.get(k))
+                else:
+                    bad = sorted(k for k in set(mine) | set(want)
+                                 if k not in mine or k not in want
+                                 or (not k.endswith(".nib") and mine[k] != want[k])
+                                 or (k.endswith(".nib") and (
+                                     _graph_without_lne(mine[k]) != _graph_without_lne(want[k])
+                                     or not mine[k].endswith(b"LNE\x00"))))
+                if bad:
+                    failed.append(f"{label} (Xcode {major}): {bad}")
+                else:
+                    compiled.append(f"{label} (Xcode {major}" + ("" if major == "26" else ", modulo LNE") + ")")
+    finally:
+        XCODE_MAJOR = saved
+
+
 def self_test():
     import glob
     import tempfile
@@ -4523,6 +4634,7 @@ def self_test():
                       for k in sorted(set(mine) | set(want))
                       if mine.get(k) != want.get(k)]
             failed.append(f"{label}: {detail}")
+    _xcode26_self_test(failed, compiled)
     if failed:
         raise SystemExit("self-test FAILED: " + "; ".join(failed))
     print(f"self-test passed (round-trip {len(nibs)} golden nibs; "
