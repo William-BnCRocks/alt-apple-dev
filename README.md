@@ -369,7 +369,9 @@ custom SF Symbol sets, app icons and Icon Composer `.icon` icons with their
 layers and Liquid Glass pre-render (FINDINGS.md). PDF imagesets need poppler's
 `pdftocairo` and HEIC images libheif's `heif-convert`. The installer adds
 both. `tools/ibtool` compiles storyboards and xibs byte-identical to Xcode 27.0
-(all of NetNewsWire's, Flutter's template pair; `tests/ibtool`). The generator
+(all of NetNewsWire's, Flutter's template pair; `tests/ibtool`), and Expo's generated
+`SplashScreen.storyboard` byte-identical to Xcode 26.5 with
+`OAD_IBTOOL_XCODE_MAJOR=26` (`tests/ibtool/golden-xcode26`). The generator
 leaves out any it cannot reproduce, with a warning. Alternate app icons are
 left out with a warning. `compat/icecubes/`, `compat/nnw/` and
 `compat/mastodon/` reproduce IceCubesApp, NetNewsWire and Mastodon for iOS.
