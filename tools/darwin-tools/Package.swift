@@ -25,5 +25,9 @@ let package = Package(
         ),
         // Linux stand-in for Apple's actool: SwiftBuild under xtool, and ship.sh for the app icon.
         .executableTarget(name: "actool", dependencies: ["DarwinAssets", .product(name: "AssetKit", package: "AssetKit")]),
+        .testTarget(
+            name: "DarwinAssetsTests",
+            dependencies: ["DarwinAssets", .product(name: "PNG", package: "swift-png")]
+        ),
     ]
 )

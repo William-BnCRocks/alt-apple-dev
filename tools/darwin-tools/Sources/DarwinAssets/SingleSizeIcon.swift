@@ -163,8 +163,10 @@ public enum SingleSizeIcon {
                     }
                 }
                 let outAlpha = a / count
+                // Alpha-weighted mean: sum(c * alpha) / sum(alpha), rounded. The
+                // premultiplied sums already carry the alpha scale, so no * 255.
                 let unpre: (Int) -> UInt8 = { channel in
-                    outAlpha == 0 ? 0 : UInt8(min(255, (channel / count) * 255 / outAlpha))
+                    a == 0 ? 0 : UInt8(min(255, (channel + a / 2) / a))
                 }
                 out.append(PNG.RGBA(unpre(r), unpre(g), unpre(b), UInt8(outAlpha)))
             }
